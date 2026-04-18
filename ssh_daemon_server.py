@@ -131,6 +131,87 @@ class SSHConnection:
                 self.connected = False
                 return -1, "", str(e)
 
+    def execute_interactive(self, command: str, conn: socket.socket, timeout: int = 3600):
+        """交互式执行命令 - 支持实时输出和输入"""
+        with self.lock:
+            if not self.connected or not self.client:
+                if not self.connect():
+                    return -1, "连接失败"
+
+            try:
+                self.last_activity = datetime.now()
+                
+                # 获取 transport 并打开 session
+                transport = self.client.get_transport()
+                channel = transport.open_session()
+                channel.settimeout(timeout)
+                
+                # 请求伪终端
+                channel.get_pty(term='xterm-256color', width=80, height=24)
+                
+                # 执行命令
+                channel.exec_command(command)
+                
+                # 设置非阻塞模式
+                channel.setblocking(False)
+                
+                # 发送开始信号给客户端
+                conn.sendall(json.dumps({'type': 'start', 'message': '交互式会话开始'}).encode('utf-8') + b'\n')
+                
+                while True:
+                    # 检查是否有输出
+                    if channel.recv_ready():
+                        data = channel.recv(4096).decode('utf-8', errors='ignore')
+                        if data:
+                            try:
+                                conn.sendall(json.dumps({'type': 'stdout', 'data': data}).encode('utf-8') + b'\n')
+                            except:
+                                break
+                    
+                    # 检查是否有错误输出
+                    if channel.recv_stderr_ready():
+                        data = channel.recv_stderr(4096).decode('utf-8', errors='ignore')
+                        if data:
+                            try:
+                                conn.sendall(json.dumps({'type': 'stderr', 'data': data}).encode('utf-8') + b'\n')
+                            except:
+                                break
+                    
+                    # 检查是否结束
+                    if channel.exit_status_ready():
+                        exit_code = channel.recv_exit_status()
+                        try:
+                            conn.sendall(json.dumps({'type': 'exit', 'exit_code': exit_code}).encode('utf-8') + b'\n')
+                        except:
+                            pass
+                        break
+                    
+                    # 接收客户端输入
+                    try:
+                        conn.setblocking(False)
+                        input_data = conn.recv(1024)
+                        if input_data:
+                            # 解析输入
+                            try:
+                                input_json = json.loads(input_data.decode('utf-8'))
+                                if input_json.get('type') == 'input':
+                                    input_text = input_json.get('data', '')
+                                    channel.send(input_text + '\n')
+                            except:
+                                pass
+                        conn.setblocking(True)
+                    except:
+                        pass
+                    
+                    time.sleep(0.01)  # 小延迟避免 CPU 占用过高
+                
+                channel.close()
+                return 0, ""
+                
+            except Exception as e:
+                self.connected = False
+                return -1, str(e)
+
     def close(self):
         """关闭连接"""
         with self.lock:
@@ -226,6 +307,27 @@ class SessionManager:
                 return -1, "", "会话不存在"
 
         return conn.execute(command, timeout)
+
+    def execute_interactive(self, name: str, command: str, conn_socket: socket.socket, timeout: int = 3600):
+        """交互式执行命令"""
+        with self.connections_lock:
+            if name not in self.connections:
+                if not self.connect_session(name):
+                    try:
+                        conn_socket.sendall(json.dumps({'type': 'error', 'data': '会话未连接且自动连接失败'}).encode('utf-8') + b'\n')
+                    except:
+                        pass
+                    return
+
+            conn = self.connections.get(name)
+            if not conn:
+                try:
+                    conn_socket.sendall(json.dumps({'type': 'error', 'data': '会话不存在'}).encode('utf-8') + b'\n')
+                except:
+                    pass
+                return
+
+        return conn.execute_interactive(command, conn_socket, timeout)
 
     def list_sessions(self) -> List[dict]:
         """列出所有会话状态"""
@@ -395,6 +497,7 @@ class DaemonServer:
     def _handle_client(self, conn: socket.socket):
         """处理客户端请求"""
         try:
+            # 初始连接超时30秒，接收请求后根据操作类型调整
             conn.settimeout(30)
 
             # 接收数据
@@ -429,13 +532,23 @@ class DaemonServer:
                 name = request.get('name')
                 command = request.get('command')
                 timeout = request.get('timeout', 60)
-                exit_code, stdout, stderr = self.session_manager.execute(name, command, timeout)
-                response = {
-                    'success': exit_code == 0,
-                    'exit_code': exit_code,
-                    'stdout': stdout,
-                    'stderr': stderr
-                }
+                interactive = request.get('interactive', False)
+                
+                if interactive:
+                    # 交互式模式 - 长连接，实时输出
+                    conn.settimeout(3600)  # 1小时超时
+                    self.session_manager.execute_interactive(name, command, conn, timeout)
+                    return  # 交互式模式自行处理连接关闭
+                else:
+                    # 非交互式模式
+                    conn.settimeout(max(timeout + 60, 600))  # 至少10分钟
+                    exit_code, stdout, stderr = self.session_manager.execute(name, command, timeout)
+                    response = {
+                        'success': exit_code == 0,
+                        'exit_code': exit_code,
+                        'stdout': stdout,
+                        'stderr': stderr
+                    }
 
             elif action == 'list':
                 sessions = self.session_manager.list_sessions()
@@ -456,16 +569,28 @@ class DaemonServer:
                 return
 
             # 发送响应
-            conn.sendall(json.dumps(response).encode('utf-8') + b'\n')
+            try:
+                conn.sendall(json.dumps(response).encode('utf-8') + b'\n')
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                pass  # 连接已关闭，忽略
 
         except json.JSONDecodeError as e:
-            error_response = json.dumps({'success': False, 'error': f'JSON解析错误: {e}'})
-            conn.sendall(error_response.encode('utf-8') + b'\n')
+            try:
+                error_response = json.dumps({'success': False, 'error': f'JSON解析错误: {e}'})
+                conn.sendall(error_response.encode('utf-8') + b'\n')
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                pass
         except Exception as e:
-            error_response = json.dumps({'success': False, 'error': str(e)})
-            conn.sendall(error_response.encode('utf-8') + b'\n')
+            try:
+                error_response = json.dumps({'success': False, 'error': str(e)})
+                conn.sendall(error_response.encode('utf-8') + b'\n')
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                pass
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except:
+                pass
 
 
 def main():

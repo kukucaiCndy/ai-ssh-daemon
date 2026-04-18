@@ -84,14 +84,20 @@ class DaemonClient:
 
         return False
 
-    def _send_request(self, request: dict) -> dict:
+    def _send_request(self, request: dict, socket_timeout: int = 300) -> dict:
         """发送请求到 Daemon"""
         if not self._is_daemon_running():
             return {'success': False, 'error': 'Daemon 未运行，请先启动: python ssh_daemon_server.py start'}
 
         try:
             sock = socket.socket(socket.AF_UNIX if platform.system() != 'Windows' else socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(30)
+            # 根据请求类型设置超时：执行命令使用更长的超时
+            action = request.get('action', '')
+            if action == 'execute':
+                # 执行命令时，使用命令超时 + 缓冲时间
+                cmd_timeout = request.get('timeout', 60)
+                socket_timeout = max(cmd_timeout + 60, 600)  # 至少10分钟
+            sock.settimeout(socket_timeout)
 
             if platform.system() == 'Windows':
                 sock.connect(('127.0.0.1', DAEMON_PORT))
@@ -133,6 +139,137 @@ class DaemonClient:
             'command': command,
             'timeout': timeout
         })
+
+    def execute_interactive(self, name: str, command: str, timeout: int = 3600):
+        """交互式执行命令 - 支持实时输出和输入"""
+        import sys
+        import threading
+        import queue
+        
+        if not self._is_daemon_running():
+            return {'success': False, 'error': 'Daemon 未运行'}
+
+        try:
+            sock = socket.socket(socket.AF_UNIX if platform.system() != 'Windows' else socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+
+            if platform.system() == 'Windows':
+                sock.connect(('127.0.0.1', DAEMON_PORT))
+            else:
+                sock.connect(str(SOCKET_PATH))
+
+            # 发送交互式执行请求
+            request = {
+                'action': 'execute',
+                'name': name,
+                'command': command,
+                'timeout': timeout,
+                'interactive': True
+            }
+            sock.sendall(json.dumps(request).encode('utf-8') + b'\n')
+
+            print(f"[交互式会话] 开始执行: {command}")
+            print("-" * 50)
+            print("[提示] 交互式模式已启动，支持实时输出")
+            print("[提示] 按 Ctrl+C 退出会话")
+            print("-" * 50)
+
+            # 用于线程间通信的队列
+            input_queue = queue.Queue()
+            stop_event = threading.Event()
+            
+            # 自动输入配置
+            AUTO_PASSWORD = "cindyhao123"  # 自动输入的密码
+            password_sent = False  # 标记密码是否已发送
+
+            # 输入线程 - 读取用户输入
+            def input_thread():
+                while not stop_event.is_set():
+                    try:
+                        user_input = input()
+                        input_queue.put(user_input)
+                    except EOFError:
+                        break
+                    except:
+                        pass
+
+            # 启动输入线程
+            input_t = threading.Thread(target=input_thread, daemon=True)
+            input_t.start()
+
+            while True:
+                try:
+                    # 检查是否有用户输入
+                    try:
+                        user_input = input_queue.get(timeout=0.1)
+                        input_msg = {'type': 'input', 'data': user_input}
+                        sock.sendall(json.dumps(input_msg).encode('utf-8') + b'\n')
+                    except queue.Empty:
+                        pass
+
+                    # 接收服务器输出
+                    try:
+                        sock.setblocking(False)
+                        data = sock.recv(4096)
+                        sock.setblocking(True)
+                        
+                        if not data:
+                            break
+                        
+                        # 处理可能的多行 JSON
+                        lines = data.decode('utf-8', errors='ignore').split('\n')
+                        for line in lines:
+                            if not line.strip():
+                                continue
+                            try:
+                                msg = json.loads(line)
+                                msg_type = msg.get('type')
+                                
+                                if msg_type == 'stdout' or msg_type == 'stderr':
+                                    output_data = msg.get('data', '')
+                                    print(output_data, end='', flush=True)
+                                    
+                                    # 检测密码提示并自动输入
+                                    if not password_sent and ('password:' in output_data.lower() or '密码' in output_data):
+                                        import time
+                                        time.sleep(0.5)  # 短暂延迟确保提示显示
+                                        input_msg = {'type': 'input', 'data': AUTO_PASSWORD}
+                                        sock.sendall(json.dumps(input_msg).encode('utf-8') + b'\n')
+                                        print(f"\n[自动输入密码] {'*' * len(AUTO_PASSWORD)}")
+                                        password_sent = True
+                                        
+                                elif msg_type == 'exit':
+                                    exit_code = msg.get('exit_code', 0)
+                                    print(f"\n{'-' * 50}")
+                                    print(f"[退出码] {exit_code}")
+                                    stop_event.set()
+                                    return {'success': exit_code == 0, 'exit_code': exit_code}
+                                elif msg_type == 'error':
+                                    print(f"[错误] {msg.get('data', '')}")
+                                    stop_event.set()
+                                    return {'success': False, 'error': msg.get('data', '')}
+                            except json.JSONDecodeError:
+                                # 如果不是 JSON，直接打印
+                                print(line, end='', flush=True)
+                    except BlockingIOError:
+                        pass
+                    except Exception as e:
+                        print(f"[接收错误] {e}")
+                        break
+
+                except KeyboardInterrupt:
+                    print("\n[用户中断]")
+                    stop_event.set()
+                    break
+                except Exception as e:
+                    print(f"[错误] {e}")
+                    break
+
+            sock.close()
+            stop_event.set()
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
 
     def list_sessions(self) -> list:
         """列出会话"""
@@ -275,6 +412,7 @@ def main():
     exec_parser = subparsers.add_parser('exec', help='执行命令')
     exec_parser.add_argument('--session', '-s', help='会话名称')
     exec_parser.add_argument('--timeout', '-t', type=int, default=60, help='超时时间')
+    exec_parser.add_argument('--interactive', '-i', action='store_true', help='交互式模式（支持实时输出和输入）')
     exec_parser.add_argument('cmd', nargs='+', help='要执行的命令')
 
     # status 命令
@@ -388,10 +526,14 @@ def main():
                 sys.exit(1)
 
             cmd = ' '.join(args.cmd)
-            print(f"[执行] {cmd}")
-            print("-" * 50)
-
-            response = client.execute(session_name, cmd, args.timeout)
+            
+            # 判断是否使用交互式模式
+            if args.interactive:
+                response = client.execute_interactive(session_name, cmd, args.timeout)
+            else:
+                print(f"[执行] {cmd}")
+                print("-" * 50)
+                response = client.execute(session_name, cmd, args.timeout)
 
             if response.get('success') or 'exit_code' in response:
                 stdout = response.get('stdout', '')
@@ -401,6 +543,7 @@ def main():
                 if stdout:
                     print(stdout)
                 if stderr:
+                    import sys
                     print(stderr, file=sys.stderr)
 
                 print("-" * 50)
